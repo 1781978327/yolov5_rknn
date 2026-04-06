@@ -299,6 +299,8 @@ int RkYolo::DrawTextWithOpenCv(const detect_result_group_t& group, int frame_wid
     uint8_t* v_ptr = u_ptr + (frame_width / 2) * (frame_height / 2);
 
     cv::Mat y_plane(frame_height, frame_width, CV_8UC1, (void*)y_ptr, y_stride);
+    cv::Mat u_plane(frame_height / 2, frame_width / 2, CV_8UC1, (void*)u_ptr, uv_stride);
+    cv::Mat v_plane(frame_height / 2, frame_width / 2, CV_8UC1, (void*)v_ptr, uv_stride);
 
     char text[256];
     const double font_scale = 0.7;
@@ -306,9 +308,40 @@ int RkYolo::DrawTextWithOpenCv(const detect_result_group_t& group, int frame_wid
     const uint8_t text_y = 235;
     const uint8_t bg_y = 20;
     const uint8_t neutral_uv = 128;
+    const int trajectory_thickness = 2;
+    const int trajectory_uv_thickness = 1;
+    const uint8_t trajectory_y = 150;
+    const uint8_t trajectory_u = 44;
+    const uint8_t trajectory_v = 21;
     for (int i = 0; i < group.count; i++) {
         const detect_result_t *det_result = &(group.results[i]);
-        sprintf(text, "%s %.1f%%", det_result->name, det_result->prop * 100);
+
+        if (det_result->track_id >= 0 && det_result->trajectory_count > 1) {
+            for (int j = 1; j < det_result->trajectory_count; ++j) {
+                const cv::Point p0(det_result->trajectory[j - 1].x, det_result->trajectory[j - 1].y);
+                const cv::Point p1(det_result->trajectory[j].x, det_result->trajectory[j].y);
+                cv::line(y_plane, p0, p1, cv::Scalar(trajectory_y), trajectory_thickness, cv::LINE_AA);
+                cv::line(u_plane, cv::Point(p0.x / 2, p0.y / 2), cv::Point(p1.x / 2, p1.y / 2),
+                         cv::Scalar(trajectory_u), trajectory_uv_thickness, cv::LINE_AA);
+                cv::line(v_plane, cv::Point(p0.x / 2, p0.y / 2), cv::Point(p1.x / 2, p1.y / 2),
+                         cv::Scalar(trajectory_v), trajectory_uv_thickness, cv::LINE_AA);
+            }
+
+            const cv::Point last_point(det_result->trajectory[det_result->trajectory_count - 1].x,
+                                       det_result->trajectory[det_result->trajectory_count - 1].y);
+            cv::circle(y_plane, last_point, 3, cv::Scalar(trajectory_y), cv::FILLED, cv::LINE_AA);
+            cv::circle(u_plane, cv::Point(last_point.x / 2, last_point.y / 2),
+                       2, cv::Scalar(trajectory_u), cv::FILLED, cv::LINE_AA);
+            cv::circle(v_plane, cv::Point(last_point.x / 2, last_point.y / 2),
+                       2, cv::Scalar(trajectory_v), cv::FILLED, cv::LINE_AA);
+        }
+
+        if (det_result->track_id >= 0) {
+            snprintf(text, sizeof(text), "ID:%d %s %.1f%%",
+                     det_result->track_id, det_result->name, det_result->prop * 100);
+        } else {
+            snprintf(text, sizeof(text), "%s %.1f%%", det_result->name, det_result->prop * 100);
+        }
         int baseline = 0;
         cv::Size text_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, font_scale, thickness, &baseline);
         baseline += thickness;
@@ -342,6 +375,27 @@ int RkYolo::DrawTextWithOpenCv(const detect_result_group_t& group, int frame_wid
     if (m_outfd > 0) {
         (void)dmaBufSync(m_outfd, false);
     }
+    return 0;
+}
+
+int RkYolo::RenderOverlay(const detect_result_group_t& group, int frame_width, int frame_height)
+{
+    detect_result_group_t overlay_group = BuildOverlayGroup(group, frame_width, frame_height);
+
+    // Keep OpenCV text as the last writer on the output buffer to avoid
+    // hardware RGA fills partially covering or invalidating CPU-rendered labels.
+    int ret = DrawBoxesWithRga(overlay_group, frame_width, frame_height);
+    if (ret < 0) {
+        LOG(ERROR, "draw boxes with rga failed");
+        return ret;
+    }
+
+    ret = DrawTextWithOpenCv(overlay_group, frame_width, frame_height);
+    if (ret < 0) {
+        LOG(ERROR, "draw text with opencv failed");
+        return ret;
+    }
+
     return 0;
 }
 
@@ -410,6 +464,7 @@ static detect_result_group_t BuildOverlayGroup(const detect_result_group_t& src,
 int RkYolo::Inference(int in_width, int in_height)
 {
     int ret = -1;
+    memset(&m_last_detect_result_group, 0, sizeof(m_last_detect_result_group));
     ret = PreprocessToInputMem(in_width, in_height);
     if (ret < 0) {
         LOG(ERROR, "preprocess to rknn io_mem failed");
@@ -448,23 +503,18 @@ int RkYolo::Inference(int in_width, int in_height)
         out_scales.push_back(m_output_attrs[i].scale);
         out_zps.push_back(m_output_attrs[i].zp);
     }
-    post_process((int8_t *)m_output_mems[0]->virt_addr, (int8_t *)m_output_mems[1]->virt_addr, (int8_t *)m_output_mems[2]->virt_addr,
-                 m_config.model_height, m_config.model_width,
-                 box_conf_threshold, nms_threshold, pads, scale_w, scale_h, out_zps, out_scales, &detect_result_group);
-
-    detect_result_group_t overlay_group = BuildOverlayGroup(detect_result_group, in_width, in_height);
-
-    ret = DrawTextWithOpenCv(overlay_group, in_width, in_height);
+    ret = post_process((int8_t *)m_output_mems[0]->virt_addr,
+                       (int8_t *)m_output_mems[1]->virt_addr,
+                       (int8_t *)m_output_mems[2]->virt_addr,
+                       m_config.model_height, m_config.model_width,
+                       box_conf_threshold, nms_threshold, pads, scale_w, scale_h, out_zps, out_scales,
+                       &detect_result_group);
     if (ret < 0) {
-        LOG(ERROR, "draw text with opencv failed");
+        LOG(ERROR, "post process failed ret=%d", ret);
         return ret;
     }
 
-    ret = DrawBoxesWithRga(overlay_group, in_width, in_height);
-    if (ret < 0) {
-        LOG(ERROR, "draw boxes with rga failed");
-        return ret;
-    }
+    m_last_detect_result_group = detect_result_group;
 
     return ret;
 }

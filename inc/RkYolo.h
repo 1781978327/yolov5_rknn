@@ -21,6 +21,11 @@ public:
 
     int Init(rknn_core_mask mask);
     int Inference(int width, int height);
+    int RenderOverlay(const detect_result_group_t& group, int frame_width, int frame_height);
+    detect_result_group_t GetLastDetectResult() const
+    {
+        return m_last_detect_result_group;
+    }
     void SetBuffers(uint8_t *inbuf, uint8_t *out_buf, int out_fd = -1)
     {
         m_inbuf = inbuf;
@@ -42,6 +47,7 @@ private:
     uint8_t *m_inbuf = nullptr;
     uint8_t *m_outbuf = nullptr;
     int m_outfd = -1;
+    detect_result_group_t m_last_detect_result_group{};
 
     Config_t m_config;
     rknn_core_mask m_core_mask;

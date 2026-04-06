@@ -328,6 +328,10 @@ TransCoder::~TransCoder()
         delete rk_encoder;
         rk_encoder = nullptr;
     }
+    if (tracker_) {
+        delete tracker_;
+        tracker_ = nullptr;
+    }
     for (auto* rkyolo : m_rkyolo_list) {
         delete rkyolo;
     }
@@ -358,6 +362,11 @@ std::vector<TransCoder::Config_t> TransCoder::LoadConfigs(const std::string& con
     const std::string default_dma_heap = configs.Get("video", "dma_heap", "/dev/dma_heap/system");
     const int default_rknn_thread = configs.GetInteger("rknn", "rknn_thread", 3);
     const std::string default_stream_name = configs.Get("server", "stream_name", "unicast");
+    const bool default_tracker_enable = configs.GetBoolean("tracker", "enable", true);
+    const int default_track_buffer = configs.GetInteger("tracker", "track_buffer", 30);
+    const float default_track_thresh = static_cast<float>(configs.GetReal("tracker", "track_thresh", 0.5));
+    const float default_high_thresh = static_cast<float>(configs.GetReal("tracker", "high_thresh", 0.6));
+    const float default_match_thresh = static_cast<float>(configs.GetReal("tracker", "match_thresh", 0.8));
 
     bool has_multi_video = false;
     for (int i = 0; i < 8; ++i) {
@@ -384,6 +393,11 @@ std::vector<TransCoder::Config_t> TransCoder::LoadConfigs(const std::string& con
             cfg.dma_buffers = std::max(2, (int)configs.GetInteger(sec.str(), "dma_buffers", default_dma_buffers));
             cfg.rknn_thread = configs.GetInteger(sec.str(), "rknn_thread", default_rknn_thread);
             cfg.rknn_thread = (cfg.rknn_thread > 6) ? 6 : cfg.rknn_thread;
+            cfg.tracker_enable = configs.GetBoolean(sec.str(), "tracker_enable", default_tracker_enable);
+            cfg.track_buffer = std::max(1, (int)configs.GetInteger(sec.str(), "track_buffer", default_track_buffer));
+            cfg.track_thresh = static_cast<float>(configs.GetReal(sec.str(), "track_thresh", default_track_thresh));
+            cfg.high_thresh = static_cast<float>(configs.GetReal(sec.str(), "high_thresh", default_high_thresh));
+            cfg.match_thresh = static_cast<float>(configs.GetReal(sec.str(), "match_thresh", default_match_thresh));
             cfg.device_name = configs.Get(sec.str(), "device", "");
             if (cfg.device_name.empty()) continue;
             cfg.stream_name = configs.Get(sec.str(), "stream_name", "cam" + std::to_string(i));
@@ -401,6 +415,11 @@ std::vector<TransCoder::Config_t> TransCoder::LoadConfigs(const std::string& con
         cfg.fix_qp = default_fix_qp;
         cfg.dma_buffers = std::max(2, default_dma_buffers);
         cfg.rknn_thread = (default_rknn_thread > 6) ? 6 : default_rknn_thread;
+        cfg.tracker_enable = configs.GetBoolean("video", "tracker_enable", default_tracker_enable);
+        cfg.track_buffer = std::max(1, (int)configs.GetInteger("video", "track_buffer", default_track_buffer));
+        cfg.track_thresh = static_cast<float>(configs.GetReal("video", "track_thresh", default_track_thresh));
+        cfg.high_thresh = static_cast<float>(configs.GetReal("video", "high_thresh", default_high_thresh));
+        cfg.match_thresh = static_cast<float>(configs.GetReal("video", "match_thresh", default_match_thresh));
         cfg.device_name = default_device;
         cfg.stream_name = default_stream_name;
         cfg.dma_heap = default_dma_heap;
@@ -423,6 +442,7 @@ void TransCoder::init()
     if (config.stream_name.empty()) config.stream_name = "unicast";
     if (config.dma_heap.empty()) config.dma_heap = "/dev/dma_heap/system";
     config.rknn_thread = (config.rknn_thread > 6) ? 6 : std::max(1, config.rknn_thread);
+    config.track_buffer = std::max(1, config.track_buffer);
 
     mpp_fmt = MPP_FMT_YUV420P;
 
@@ -494,6 +514,17 @@ void TransCoder::init()
         }
         m_rkyolo_list.push_back(rkyolo);
     }
+    if (config.tracker_enable) {
+        tracker_ = new ByteTrackerWrapper(config.fps, config.track_buffer,
+                                          config.track_thresh, config.high_thresh, config.match_thresh);
+        if (!tracker_) {
+            LOG(ERROR, "[%s] create bytetrack failed", config.stream_name.c_str());
+            return;
+        }
+        LOG(NOTICE, "[%s] ByteTrack enabled buffer=%d track=%.2f high=%.2f match=%.2f",
+            config.stream_name.c_str(), config.track_buffer,
+            config.track_thresh, config.high_thresh, config.match_thresh);
+    }
     m_cur_yolo = 0;
     ready_ = true;
 }
@@ -540,6 +571,7 @@ void TransCoder::run()
             job.slot = slot;
             job.input_size = output_frame_size_;
             job.capture_index = capture_index;
+            job.yolo = cur_yolo;
             job.future = m_pool->enqueue(&RkYolo::Inference, cur_yolo, config.width, config.height);
             pending_jobs_.push_back(std::move(job));
 
@@ -554,6 +586,21 @@ void TransCoder::run()
                     LOG(ERROR, "[%s] inference failed on slot %d ret=%d",
                         config.stream_name.c_str(), finished.slot, infer_ret);
                     continue;
+                }
+                detect_result_group_t overlay_group{};
+                if (finished.yolo) {
+                    overlay_group = finished.yolo->GetLastDetectResult();
+                }
+                if (tracker_) {
+                    overlay_group = tracker_->Update(overlay_group);
+                }
+                if (finished.yolo) {
+                    int render_ret = finished.yolo->RenderOverlay(overlay_group, config.width, config.height);
+                    if (render_ret != 0) {
+                        LOG(ERROR, "[%s] render overlay failed on slot %d ret=%d",
+                            config.stream_name.c_str(), finished.slot, render_ret);
+                        continue;
+                    }
                 }
                 auto& out_dma = output_dma_buffers_.at(finished.slot);
                 frameSize = rk_encoder->encode_dmabuf(out_dma.fd, out_dma.va,
@@ -583,6 +630,19 @@ void TransCoder::run()
         }
         if (infer_ret != 0) {
             continue;
+        }
+        detect_result_group_t overlay_group{};
+        if (finished.yolo) {
+            overlay_group = finished.yolo->GetLastDetectResult();
+        }
+        if (tracker_) {
+            overlay_group = tracker_->Update(overlay_group);
+        }
+        if (finished.yolo) {
+            int render_ret = finished.yolo->RenderOverlay(overlay_group, config.width, config.height);
+            if (render_ret != 0) {
+                continue;
+            }
         }
         auto& out_dma = output_dma_buffers_.at(finished.slot);
         frameSize = rk_encoder->encode_dmabuf(out_dma.fd, out_dma.va,

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "MThread.h"
+#include "ByteTrackerWrapper.h"
 #include "RkEncoder.h"
 #include "RkYolo.h"
 #include "ThreadPool.h"
@@ -37,12 +38,17 @@ public:
     } V4l2DmabufCapture_t;
 
     typedef struct {
-        int width;
-        int height;
-        int fps;
-        int fix_qp;
-        int rknn_thread;
-        int dma_buffers;
+        int width = 0;
+        int height = 0;
+        int fps = 0;
+        int fix_qp = 0;
+        int rknn_thread = 0;
+        int dma_buffers = 0;
+        bool tracker_enable = true;
+        int track_buffer = 30;
+        float track_thresh = 0.5f;
+        float high_thresh = 0.6f;
+        float match_thresh = 0.8f;
         std::string device_name;
         std::string stream_name;
         std::string section_name;
@@ -66,6 +72,7 @@ private:
         int slot = -1;
         int input_size = 0;
         int capture_index = -1;
+        RkYolo* yolo = nullptr;
         std::future<int> future;
     };
 
@@ -79,6 +86,7 @@ private:
 
     RkEncoder *rk_encoder = nullptr;
     std::vector<RkYolo *> m_rkyolo_list;
+    ByteTrackerWrapper *tracker_ = nullptr;
     ThreadPool *m_pool = nullptr;
     int m_cur_yolo = 0;
     int output_frame_size_ = 0;
