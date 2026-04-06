@@ -317,6 +317,13 @@ TransCoder::TransCoder(const Config_t& cfg)
 TransCoder::~TransCoder()
 {
     v4l2_dmabuf_close(&dmabuf_capture_);
+    for (auto& b : output_dma_buffers_) {
+        dma_buf_free(b.fd, b.va, b.size);
+        b.fd = -1;
+        b.va = nullptr;
+        b.size = 0;
+    }
+    output_dma_buffers_.clear();
     if (rk_encoder) {
         delete rk_encoder;
         rk_encoder = nullptr;
@@ -443,6 +450,16 @@ void TransCoder::init()
         return;
     }
 
+    output_dma_buffers_.resize(config.rknn_thread);
+    for (int i = 0; i < config.rknn_thread; ++i) {
+        auto& b = output_dma_buffers_[i];
+        b.size = output_frame_size_;
+        if (dma_buf_alloc(config.dma_heap, b.size, &b.fd, &b.va) != 0) {
+            LOG(ERROR, "[%s] alloc output dma buffer failed on slot %d", config.stream_name.c_str(), i);
+            return;
+        }
+    }
+
     Encoder_Param_t encoder_param{
         mpp_fmt,
         config.width,
@@ -488,7 +505,6 @@ void TransCoder::run()
         return;
     }
     timeval tv;
-    m_out_buffer_list.resize(config.rknn_thread, std::vector<uint8_t>(output_frame_size_));
     for (;;) {
         if (isStoped()) {
             break;
@@ -513,7 +529,7 @@ void TransCoder::run()
             }
 
             RkYolo *cur_yolo = m_rkyolo_list.at(slot);
-            cur_yolo->SetBuffers((uint8_t*)capture_buf.va, m_out_buffer_list.at(slot).data());
+            cur_yolo->SetBuffers((uint8_t*)capture_buf.va, (uint8_t*)output_dma_buffers_.at(slot).va);
 
             m_cur_yolo++;
             frameSize = 0;
@@ -537,7 +553,10 @@ void TransCoder::run()
                         config.stream_name.c_str(), finished.slot, infer_ret);
                     continue;
                 }
-                frameSize = rk_encoder->encode(m_out_buffer_list.at(finished.slot).data(), finished.input_size, encodeData);
+                auto& out_dma = output_dma_buffers_.at(finished.slot);
+                frameSize = rk_encoder->encode_dmabuf(out_dma.fd, out_dma.va,
+                                                     config.width, config.height,
+                                                     finished.input_size, encodeData);
                 LOG(INFO, "encodeData size %d", frameSize);
                 if (rk_encoder->startCode3(encodeData))
                     startCode = 3;
@@ -563,7 +582,10 @@ void TransCoder::run()
         if (infer_ret != 0) {
             continue;
         }
-        frameSize = rk_encoder->encode(m_out_buffer_list.at(finished.slot).data(), finished.input_size, encodeData);
+        auto& out_dma = output_dma_buffers_.at(finished.slot);
+        frameSize = rk_encoder->encode_dmabuf(out_dma.fd, out_dma.va,
+                                             config.width, config.height,
+                                             finished.input_size, encodeData);
         if (frameSize <= 0) {
             continue;
         }

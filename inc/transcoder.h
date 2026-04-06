@@ -85,7 +85,7 @@ private:
     V4l2DmabufCapture_t dmabuf_capture_;
 
     std::vector<std::vector<uint8_t>> m_in_buffer_list;
-    std::vector<std::vector<uint8_t>> m_out_buffer_list;
+    std::vector<DmaBuffer_t> output_dma_buffers_;
     std::deque<PendingJob> pending_jobs_;
 };
 

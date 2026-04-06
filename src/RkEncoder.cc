@@ -4,6 +4,7 @@
 #include <linux/videodev2.h>
 #include <unistd.h>
 #include <memory.h>
+#include <cstring>
 
 #define MPP_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
@@ -27,6 +28,14 @@ RkEncoder::RkEncoder(Encoder_Param_t param) :
 
 RkEncoder::~RkEncoder()
 {
+    if (m_dma_group) {
+        mpp_buffer_group_put(m_dma_group);
+        m_dma_group = nullptr;
+    }
+    if (m_buffer) {
+        mpp_buffer_put(m_buffer);
+        m_buffer = nullptr;
+    }
     if (m_contex) {
         m_mpi->reset(m_contex);
         mpp_destroy(m_contex);
@@ -58,6 +67,7 @@ int RkEncoder::init()
     }
 
     mpp_buffer_get(NULL, &m_buffer, m_param.frame_size);
+    mpp_buffer_group_get_external(&m_dma_group, MPP_BUFFER_TYPE_DRM);
 
     /* fix input / output frame rate */
     mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);
@@ -110,6 +120,47 @@ int RkEncoder::init()
     return ret;
 }
 
+int RkEncoder::copy_packet_to_buffer(uint8_t *outbuf)
+{
+    if (!m_packet || !outbuf) {
+        return -1;
+    }
+
+    MppPacket m_extra_info = NULL;
+    MppBuffer buffer = NULL;
+    size_t size = 1024;
+    int ret = 0;
+
+    mpp_buffer_get(NULL, &buffer, size);
+    mpp_packet_init_with_buffer(&m_extra_info, buffer);
+    mpp_packet_set_length(m_extra_info, 0);
+
+    ret = m_mpi->control(m_contex, MPP_ENC_GET_HDR_SYNC, m_extra_info);
+    if (ret) {
+        LOG(ERROR, "mpi control enc get header sync failed");
+        mpp_packet_deinit(&m_extra_info);
+        if (buffer)
+            mpp_buffer_put(buffer);
+        return -1;
+    }
+
+    void *ptr_extra_info = mpp_packet_get_data(m_extra_info);
+    size_t len_extra_info = mpp_packet_get_length(m_extra_info);
+    memcpy(outbuf, ptr_extra_info, len_extra_info);
+
+    mpp_packet_deinit(&m_extra_info);
+    if (buffer)
+        mpp_buffer_put(buffer);
+
+    void *ptr_video_data = mpp_packet_get_data(m_packet);
+    size_t len_video_data = mpp_packet_get_length(m_packet);
+    memcpy(outbuf + len_extra_info, ptr_video_data, len_video_data);
+    mpp_packet_deinit(&m_packet);
+    m_packet = nullptr;
+
+    return static_cast<int>(len_extra_info + len_video_data);
+}
+
 int RkEncoder::encode(void *inbuf, int insize, uint8_t *outbuf)
 {
     int ret = 0;
@@ -140,40 +191,79 @@ int RkEncoder::encode(void *inbuf, int insize, uint8_t *outbuf)
     ret = m_mpi->encode_get_packet(m_contex, &m_packet);
     if (ret) {
         LOG(ERROR, "encoder get packet failed error:%d", ret);
+        mpp_frame_deinit(&m_frame);
         return -1;
     }
 
-    MppPacket m_extra_info = NULL;
-    MppBuffer buffer = NULL;
-    size_t size = 1024;
+    ret = copy_packet_to_buffer(outbuf);
+    mpp_frame_deinit(&m_frame);
+    return ret;
+}
 
-    mpp_buffer_get(NULL, &buffer, size);
-    mpp_packet_init_with_buffer(&m_extra_info, buffer);
-    mpp_packet_set_length(m_extra_info, 0);
-    
-    ret = m_mpi->control(m_contex, MPP_ENC_GET_HDR_SYNC, m_extra_info);
-    if (ret) {
-        LOG(ERROR, "mpi control enc get header sync failed");
-        mpp_packet_deinit(&m_extra_info);
-        if (buffer)
-            mpp_buffer_put(buffer);
+int RkEncoder::encode_dmabuf(int dma_fd, void* dma_ptr, int hor_stride, int ver_stride, int insize, uint8_t *outbuf)
+{
+    if (dma_fd < 0 || !dma_ptr || !outbuf || !m_dma_group) {
         return -1;
     }
 
-    void *ptr_extra_info = mpp_packet_get_data(m_extra_info);
-    size_t len_extra_info = mpp_packet_get_length(m_extra_info);
-    memcpy(outbuf, ptr_extra_info, len_extra_info);
+    MppBufferInfo ext_info;
+    memset(&ext_info, 0, sizeof(ext_info));
+    ext_info.type = MPP_BUFFER_TYPE_DRM;
+    ext_info.fd = dma_fd;
+    ext_info.ptr = dma_ptr;
+    ext_info.size = insize;
 
-    mpp_packet_deinit(&m_extra_info);
-    if (buffer)
-        mpp_buffer_put(buffer);
+    MPP_RET ret = mpp_buffer_commit(m_dma_group, &ext_info);
+    if (ret != MPP_OK) {
+        LOG(ERROR, "mpp_buffer_commit failed error:%d", ret);
+        return -1;
+    }
 
-    void *ptr_video_data = mpp_packet_get_data(m_packet);
-    size_t len_video_data = mpp_packet_get_length(m_packet);
-    memcpy(outbuf + len_extra_info, ptr_video_data, len_video_data);
-    mpp_packet_deinit(&m_packet);
+    MppBuffer ext_buffer = nullptr;
+    ret = mpp_buffer_get(m_dma_group, &ext_buffer, insize);
+    if (ret != MPP_OK) {
+        LOG(ERROR, "mpp_buffer_get external failed error:%d", ret);
+        mpp_buffer_group_clear(m_dma_group);
+        return -1;
+    }
 
-    size_t len = len_extra_info + len_video_data;
+    ret = mpp_frame_init(&m_frame);
+    if (ret != MPP_OK) {
+        mpp_buffer_put(ext_buffer);
+        mpp_buffer_group_clear(m_dma_group);
+        return -1;
+    }
+
+    mpp_frame_set_width(m_frame, m_param.width);
+    mpp_frame_set_height(m_frame, m_param.height);
+    mpp_frame_set_hor_stride(m_frame, hor_stride > 0 ? hor_stride : m_param.width);
+    mpp_frame_set_ver_stride(m_frame, ver_stride > 0 ? ver_stride : m_param.height);
+    mpp_frame_set_fmt(m_frame, m_param.fmt);
+    mpp_frame_set_eos(m_frame, 1);
+    mpp_frame_set_buffer(m_frame, ext_buffer);
+
+    ret = m_mpi->encode_put_frame(m_contex, m_frame);
+    if (ret != MPP_OK) {
+        LOG(ERROR, "encoder put dma frame failed error:%d", ret);
+        mpp_frame_deinit(&m_frame);
+        mpp_buffer_put(ext_buffer);
+        mpp_buffer_group_clear(m_dma_group);
+        return -1;
+    }
+
+    ret = m_mpi->encode_get_packet(m_contex, &m_packet);
+    if (ret != MPP_OK) {
+        LOG(ERROR, "encoder get dma packet failed error:%d", ret);
+        mpp_frame_deinit(&m_frame);
+        mpp_buffer_put(ext_buffer);
+        mpp_buffer_group_clear(m_dma_group);
+        return -1;
+    }
+
+    int len = copy_packet_to_buffer(outbuf);
+    mpp_frame_deinit(&m_frame);
+    mpp_buffer_put(ext_buffer);
+    mpp_buffer_group_clear(m_dma_group);
     return len;
 }
 
