@@ -7,14 +7,39 @@
 #include <RgaUtils.h>
 #include <string.h>
 #include <algorithm>
+#include <cstdint>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <opencv2/core/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <vector>
 
+#if __has_include(<linux/dma-buf.h>)
+#include <linux/dma-buf.h>
+#else
+#ifndef DMA_BUF_BASE
+#define DMA_BUF_BASE 'b'
+struct dma_buf_sync {
+    uint64_t flags;
+};
+#define DMA_BUF_SYNC_READ        (1ULL << 0)
+#define DMA_BUF_SYNC_WRITE       (2ULL << 0)
+#define DMA_BUF_SYNC_RW          (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
+#define DMA_BUF_SYNC_START       (0ULL << 2)
+#define DMA_BUF_SYNC_END         (1ULL << 2)
+#define DMA_BUF_IOCTL_SYNC       _IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
+#endif
+#endif
+
 static void drawTextWithBackground(cv::Mat &image, const std::string &text, cv::Point org,
                                    int fontFace, double fontScale, cv::Scalar textColor,
                                    cv::Scalar bgColor, int thickness);
+static void fillPlaneRect(uint8_t* plane, int stride, int plane_width, int plane_height,
+                          const cv::Rect& rect, uint8_t value);
+static int dmaBufSync(int fd, bool start);
+static detect_result_group_t BuildOverlayGroup(const detect_result_group_t& src,
+                                               int frame_width, int frame_height);
 
 RkYolo::RkYolo()
 {
@@ -240,10 +265,10 @@ int RkYolo::DrawBoxesWithRga(const detect_result_group_t& group, int frame_width
     const int color = 0x00FF00;
     for (int i = 0; i < group.count; ++i) {
         const detect_result_t *det_result = &(group.results[i]);
-        int x1 = std::max(0, std::min(frame_width - 1, det_result->box.left));
-        int y1 = std::max(0, std::min(frame_height - 1, det_result->box.top));
-        int x2 = std::max(0, std::min(frame_width, det_result->box.right));
-        int y2 = std::max(0, std::min(frame_height, det_result->box.bottom));
+        int x1 = det_result->box.left;
+        int y1 = det_result->box.top;
+        int x2 = det_result->box.right;
+        int y2 = det_result->box.bottom;
         if (x2 <= x1 || y2 <= y1) continue;
 
         im_rect top = {x1, y1, x2 - x1, std::min(thickness, y2 - y1)};
@@ -263,26 +288,60 @@ int RkYolo::DrawTextWithOpenCv(const detect_result_group_t& group, int frame_wid
 {
     if (!m_outbuf || frame_width <= 0 || frame_height <= 0) return -1;
     if (group.count <= 0) return 0;
+    if (m_outfd > 0) {
+        (void)dmaBufSync(m_outfd, true);
+    }
 
-    cv::Mat yuv_i420(frame_height + frame_height / 2, frame_width, CV_8UC1, (void*)m_outbuf);
-    cv::Mat bgr;
-    cv::cvtColor(yuv_i420, bgr, cv::COLOR_YUV2BGR_I420);
+    const int y_stride = frame_width;
+    const int uv_stride = frame_width / 2;
+    uint8_t* y_ptr = m_outbuf;
+    uint8_t* u_ptr = y_ptr + frame_width * frame_height;
+    uint8_t* v_ptr = u_ptr + (frame_width / 2) * (frame_height / 2);
+
+    cv::Mat y_plane(frame_height, frame_width, CV_8UC1, (void*)y_ptr, y_stride);
 
     char text[256];
+    const double font_scale = 0.7;
+    const int thickness = 2;
+    const uint8_t text_y = 235;
+    const uint8_t bg_y = 20;
+    const uint8_t neutral_uv = 128;
     for (int i = 0; i < group.count; i++) {
         const detect_result_t *det_result = &(group.results[i]);
         sprintf(text, "%s %.1f%%", det_result->name, det_result->prop * 100);
-        int x = std::max(0, det_result->box.left);
-        int y = std::max(16, det_result->box.top - 6);
-        drawTextWithBackground(bgr, text, cv::Point(x, y),
-                               cv::FONT_HERSHEY_SIMPLEX, 0.55,
-                               cv::Scalar(255, 255, 255),
-                               cv::Scalar(0, 64, 0), 2);
-    }
+        int baseline = 0;
+        cv::Size text_size = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, font_scale, thickness, &baseline);
+        baseline += thickness;
 
-    cv::Mat yuv_out;
-    cv::cvtColor(bgr, yuv_out, cv::COLOR_BGR2YUV_I420);
-    memcpy(m_outbuf, yuv_out.data, frame_width * frame_height * 3 / 2);
+        int x = det_result->box.left;
+        int y = std::max(text_size.height + baseline + 2, det_result->box.top - 6);
+        if (x + text_size.width + 4 > frame_width) {
+            x = std::max(0, frame_width - text_size.width - 4);
+        }
+
+        cv::Rect bg_rect(x,
+                         std::max(0, y - text_size.height - baseline - 2),
+                         std::min(frame_width - x, text_size.width + 4),
+                         std::min(frame_height - std::max(0, y - text_size.height - baseline - 2),
+                                  text_size.height + baseline + 4));
+        if (bg_rect.width <= 0 || bg_rect.height <= 0) continue;
+
+        cv::rectangle(y_plane, bg_rect, cv::Scalar(bg_y), cv::FILLED);
+
+        cv::Rect uv_rect(bg_rect.x / 2,
+                         bg_rect.y / 2,
+                         (bg_rect.width + 1) / 2,
+                         (bg_rect.height + 1) / 2);
+        fillPlaneRect(u_ptr, uv_stride, frame_width / 2, frame_height / 2, uv_rect, neutral_uv);
+        fillPlaneRect(v_ptr, uv_stride, frame_width / 2, frame_height / 2, uv_rect, neutral_uv);
+
+        cv::putText(y_plane, text, cv::Point(x + 2, y - 2),
+                    cv::FONT_HERSHEY_SIMPLEX, font_scale,
+                    cv::Scalar(text_y), thickness, cv::LINE_8);
+    }
+    if (m_outfd > 0) {
+        (void)dmaBufSync(m_outfd, false);
+    }
     return 0;
 }
 
@@ -293,7 +352,59 @@ void drawTextWithBackground(cv::Mat &image, const std::string &text, cv::Point o
     baseline += thickness;
     cv::Rect textBgRect(org.x, org.y - textSize.height, textSize.width, textSize.height + baseline);
     cv::rectangle(image, textBgRect, bgColor, cv::FILLED);
-    cv::putText(image, text, org, fontFace, fontScale, textColor, thickness);
+    cv::putText(image, text, org, fontFace, fontScale, textColor, thickness, cv::LINE_AA);
+}
+
+static int dmaBufSync(int fd, bool start)
+{
+    if (fd < 0) return -1;
+    struct dma_buf_sync sync;
+    memset(&sync, 0, sizeof(sync));
+    sync.flags = (start ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END) | DMA_BUF_SYNC_RW;
+    return ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+}
+
+static void fillPlaneRect(uint8_t* plane, int stride, int plane_width, int plane_height,
+                          const cv::Rect& rect, uint8_t value)
+{
+    if (!plane || stride <= 0 || plane_width <= 0 || plane_height <= 0) return;
+
+    int x0 = std::max(0, rect.x);
+    int y0 = std::max(0, rect.y);
+    int x1 = std::min(plane_width, rect.x + rect.width);
+    int y1 = std::min(plane_height, rect.y + rect.height);
+    if (x1 <= x0 || y1 <= y0) return;
+
+    for (int y = y0; y < y1; ++y) {
+        memset(plane + y * stride + x0, value, x1 - x0);
+    }
+}
+
+static detect_result_group_t BuildOverlayGroup(const detect_result_group_t& src,
+                                               int frame_width, int frame_height)
+{
+    detect_result_group_t dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.id = src.id;
+
+    for (int i = 0; i < src.count && dst.count < OBJ_NUMB_MAX_SIZE; ++i) {
+        const detect_result_t* det = &src.results[i];
+        int x1 = std::max(0, std::min(frame_width - 1, det->box.left));
+        int y1 = std::max(0, std::min(frame_height - 1, det->box.top));
+        int x2 = std::max(0, std::min(frame_width, det->box.right));
+        int y2 = std::max(0, std::min(frame_height, det->box.bottom));
+        if (x2 <= x1 || y2 <= y1) {
+            continue;
+        }
+
+        detect_result_t* out = &dst.results[dst.count++];
+        memcpy(out, det, sizeof(detect_result_t));
+        out->box.left = x1;
+        out->box.top = y1;
+        out->box.right = x2;
+        out->box.bottom = y2;
+    }
+    return dst;
 }
 
 int RkYolo::Inference(int in_width, int in_height)
@@ -341,15 +452,17 @@ int RkYolo::Inference(int in_width, int in_height)
                  m_config.model_height, m_config.model_width,
                  box_conf_threshold, nms_threshold, pads, scale_w, scale_h, out_zps, out_scales, &detect_result_group);
 
-    ret = DrawBoxesWithRga(detect_result_group, in_width, in_height);
+    detect_result_group_t overlay_group = BuildOverlayGroup(detect_result_group, in_width, in_height);
+
+    ret = DrawTextWithOpenCv(overlay_group, in_width, in_height);
     if (ret < 0) {
-        LOG(ERROR, "draw boxes with rga failed");
+        LOG(ERROR, "draw text with opencv failed");
         return ret;
     }
 
-    ret = DrawTextWithOpenCv(detect_result_group, in_width, in_height);
+    ret = DrawBoxesWithRga(overlay_group, in_width, in_height);
     if (ret < 0) {
-        LOG(ERROR, "draw text with opencv failed");
+        LOG(ERROR, "draw boxes with rga failed");
         return ret;
     }
 
