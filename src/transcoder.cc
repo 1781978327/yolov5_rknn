@@ -529,7 +529,9 @@ void TransCoder::run()
             }
 
             RkYolo *cur_yolo = m_rkyolo_list.at(slot);
-            cur_yolo->SetBuffers((uint8_t*)capture_buf.va, (uint8_t*)output_dma_buffers_.at(slot).va);
+            cur_yolo->SetBuffers((uint8_t*)capture_buf.va,
+                                 (uint8_t*)output_dma_buffers_.at(slot).va,
+                                 output_dma_buffers_.at(slot).fd);
 
             m_cur_yolo++;
             frameSize = 0;

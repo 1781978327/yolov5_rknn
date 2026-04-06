@@ -6,6 +6,7 @@
 #include <im2d.h>
 #include <RgaUtils.h>
 #include <string.h>
+#include <algorithm>
 #include <opencv2/core/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -197,6 +198,63 @@ int RkYolo::PreprocessToInputMem(int in_width, int in_height)
     return rknn_mem_sync(m_rknn_ctx, m_input_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
 }
 
+int RkYolo::ConvertInputToOutputYuv(int in_width, int in_height)
+{
+    if (!m_inbuf || !m_outbuf) return -1;
+
+    rga_buffer_t src = wrapbuffer_virtualaddr((void *)m_inbuf, in_width, in_height, RK_FORMAT_YUYV_422);
+    rga_buffer_t dst;
+    if (m_outfd > 0) {
+        dst = wrapbuffer_fd(m_outfd, in_width, in_height, RK_FORMAT_YCbCr_420_P, in_width, in_height);
+    } else {
+        dst = wrapbuffer_virtualaddr((void *)m_outbuf, in_width, in_height, RK_FORMAT_YCbCr_420_P, in_width, in_height);
+    }
+
+    IM_STATUS status = imcvtcolor(src, dst, RK_FORMAT_YUYV_422, RK_FORMAT_YCbCr_420_P);
+    if (status != IM_STATUS_SUCCESS && status != IM_STATUS_NOERROR) {
+        LOG(ERROR, "%d, output yuv convert error! %s", __LINE__, imStrError(status));
+        return -1;
+    }
+    return 0;
+}
+
+int RkYolo::DrawBoxesWithRga(const detect_result_group_t& group, int frame_width, int frame_height)
+{
+    if (!m_outbuf || frame_width <= 0 || frame_height <= 0) return -1;
+
+    rga_buffer_t dst;
+    if (m_outfd > 0) {
+        dst = wrapbuffer_fd(m_outfd, frame_width, frame_height, RK_FORMAT_YCbCr_420_P, frame_width, frame_height);
+    } else {
+        dst = wrapbuffer_virtualaddr((void *)m_outbuf, frame_width, frame_height, RK_FORMAT_YCbCr_420_P, frame_width, frame_height);
+    }
+
+    // planar YUV + color fill 更适合走 RGA2，避免在 RK3588 上命中功能限制。
+    (void)imconfig(IM_CONFIG_SCHEDULER_CORE, IM_SCHEDULER_RGA2_DEFAULT);
+
+    const int thickness = 2;
+    const int color = 0x00FF00;
+    for (int i = 0; i < group.count; ++i) {
+        const detect_result_t *det_result = &(group.results[i]);
+        int x1 = std::max(0, std::min(frame_width - 1, det_result->box.left));
+        int y1 = std::max(0, std::min(frame_height - 1, det_result->box.top));
+        int x2 = std::max(0, std::min(frame_width, det_result->box.right));
+        int y2 = std::max(0, std::min(frame_height, det_result->box.bottom));
+        if (x2 <= x1 || y2 <= y1) continue;
+
+        im_rect top = {x1, y1, x2 - x1, std::min(thickness, y2 - y1)};
+        im_rect bottom = {x1, std::max(y1, y2 - thickness), x2 - x1, std::min(thickness, y2 - y1)};
+        im_rect left = {x1, y1, std::min(thickness, x2 - x1), y2 - y1};
+        im_rect right = {std::max(x1, x2 - thickness), y1, std::min(thickness, x2 - x1), y2 - y1};
+
+        if (top.width > 0 && top.height > 0) (void)imfill(dst, top, color, IM_SYNC);
+        if (bottom.width > 0 && bottom.height > 0) (void)imfill(dst, bottom, color, IM_SYNC);
+        if (left.width > 0 && left.height > 0) (void)imfill(dst, left, color, IM_SYNC);
+        if (right.width > 0 && right.height > 0) (void)imfill(dst, right, color, IM_SYNC);
+    }
+    return 0;
+}
+
 void drawTextWithBackground(cv::Mat &image, const std::string &text, cv::Point org, int fontFace, double fontScale, cv::Scalar textColor, cv::Scalar bgColor, int thickness)
 {
     int baseline = 0;
@@ -216,10 +274,6 @@ int RkYolo::Inference(int in_width, int in_height)
         return ret;
     }
 
-    cv::Mat yuvImage(in_height, in_width, CV_8UC2, (void *)m_inbuf);
-    cv::Mat ori_img;
-    cvtColor(yuvImage, ori_img, cv::COLOR_YUV2RGB_YUY2); // Use COLOR_YUV2BGR_YUY2 for YUYV format
-
     ret = rknn_run(m_rknn_ctx, NULL);
     if (ret < 0) {
         LOG(ERROR, "rknn_run failed ret=%d", ret);
@@ -229,6 +283,12 @@ int RkYolo::Inference(int in_width, int in_height)
         if (mem) {
             rknn_mem_sync(m_rknn_ctx, mem, RKNN_MEMORY_SYNC_FROM_DEVICE);
         }
+    }
+
+    ret = ConvertInputToOutputYuv(in_width, in_height);
+    if (ret < 0) {
+        LOG(ERROR, "convert input to output yuv failed");
+        return ret;
     }
 
     // post process
@@ -250,28 +310,11 @@ int RkYolo::Inference(int in_width, int in_height)
                  m_config.model_height, m_config.model_width,
                  box_conf_threshold, nms_threshold, pads, scale_w, scale_h, out_zps, out_scales, &detect_result_group);
 
-    // Draw Objects
-    char text[256];
-    for (int i = 0; i < detect_result_group.count; i++) {
-        detect_result_t *det_result = &(detect_result_group.results[i]);
-        sprintf(text, "%s %.1f%%", det_result->name, det_result->prop * 100);
-        int x1 = det_result->box.left;
-        int y1 = det_result->box.top;
-        int x2 = det_result->box.right;
-        int y2 = det_result->box.bottom;
-        cv::Rect rect(x1, y1, x2 - x1, y2 - y1);
-        cv::Scalar color = cv::Scalar(0, 55, 218);
-        cv::rectangle(ori_img, rect, color, 2);
-        drawTextWithBackground(ori_img, text, cv::Point(x1 - 1, y1 - 6), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), cv::Scalar(0, 55, 218, 0.5), 2);
+    ret = DrawBoxesWithRga(detect_result_group, in_width, in_height);
+    if (ret < 0) {
+        LOG(ERROR, "draw boxes with rga failed");
+        return ret;
     }
-
-    cv::Mat resized_img;
-    resize(ori_img, resized_img, cv::Size(in_width, in_height));
-
-    cv::Mat yuv_img;
-    cv::cvtColor(resized_img, yuv_img, cv::COLOR_RGB2YUV_I420);
-
-    memcpy(m_outbuf, yuv_img.data, in_width * in_height * 3 / 2);
 
     return ret;
 }
