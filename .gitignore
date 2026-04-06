@@ -1,0 +1,5 @@
+.vscode/
+build/
+build_localtest/
+thirdparty/mpp
+.clang-format
