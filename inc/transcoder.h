@@ -11,6 +11,7 @@
 
 #include "MThread.h"
 #include "ByteTrackerWrapper.h"
+#include "DeepSortWrapper.h"
 #include "RkEncoder.h"
 #include "RkYolo.h"
 #include "ThreadPool.h"
@@ -18,6 +19,12 @@
 class TransCoder : public MThread
 {
 public:
+    enum class TrackerType {
+        NONE = 0,
+        BYTETRACK,
+        DEEPSORT
+    };
+
     typedef struct {
         int fd = -1;
         void* va = nullptr;
@@ -45,10 +52,16 @@ public:
         int rknn_thread = 0;
         int dma_buffers = 0;
         bool tracker_enable = true;
+        std::string tracker_type = "bytetrack";
         int track_buffer = 30;
         float track_thresh = 0.5f;
         float high_thresh = 0.6f;
         float match_thresh = 0.8f;
+        std::string reid_model_path;
+        int reid_feature_dim = 512;
+        int reid_interval = 1;
+        int reid_cpu_id = 6;
+        int reid_npu_core = 2;
         std::string device_name;
         std::string stream_name;
         std::string section_name;
@@ -86,7 +99,9 @@ private:
 
     RkEncoder *rk_encoder = nullptr;
     std::vector<RkYolo *> m_rkyolo_list;
-    ByteTrackerWrapper *tracker_ = nullptr;
+    TrackerType tracker_type_ = TrackerType::NONE;
+    ByteTrackerWrapper *byte_tracker_ = nullptr;
+    DeepSortWrapper *deep_sort_tracker_ = nullptr;
     ThreadPool *m_pool = nullptr;
     int m_cur_yolo = 0;
     int output_frame_size_ = 0;

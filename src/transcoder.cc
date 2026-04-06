@@ -32,6 +32,34 @@ struct dma_heap_allocation_data {
 
 namespace {
 
+static TransCoder::TrackerType parse_tracker_type(const std::string& tracker_type, bool tracker_enable)
+{
+    if (!tracker_enable) {
+        return TransCoder::TrackerType::NONE;
+    }
+    if (tracker_type == "deepsort") {
+        return TransCoder::TrackerType::DEEPSORT;
+    }
+    if (tracker_type == "none" || tracker_type == "off" || tracker_type == "disable") {
+        return TransCoder::TrackerType::NONE;
+    }
+    return TransCoder::TrackerType::BYTETRACK;
+}
+
+static rknn_core_mask parse_rknn_core_mask(int core_id)
+{
+    switch (core_id) {
+    case 0:
+        return RKNN_NPU_CORE_0;
+    case 1:
+        return RKNN_NPU_CORE_1;
+    case 2:
+        return RKNN_NPU_CORE_2;
+    default:
+        return RKNN_NPU_CORE_2;
+    }
+}
+
 static int dma_buf_alloc(const std::string& heap_path, size_t size, int* fd_out, void** va_out)
 {
     int heap_fd = open(heap_path.c_str(), O_RDWR | O_CLOEXEC);
@@ -328,9 +356,13 @@ TransCoder::~TransCoder()
         delete rk_encoder;
         rk_encoder = nullptr;
     }
-    if (tracker_) {
-        delete tracker_;
-        tracker_ = nullptr;
+    if (byte_tracker_) {
+        delete byte_tracker_;
+        byte_tracker_ = nullptr;
+    }
+    if (deep_sort_tracker_) {
+        delete deep_sort_tracker_;
+        deep_sort_tracker_ = nullptr;
     }
     for (auto* rkyolo : m_rkyolo_list) {
         delete rkyolo;
@@ -363,10 +395,16 @@ std::vector<TransCoder::Config_t> TransCoder::LoadConfigs(const std::string& con
     const int default_rknn_thread = configs.GetInteger("rknn", "rknn_thread", 3);
     const std::string default_stream_name = configs.Get("server", "stream_name", "unicast");
     const bool default_tracker_enable = configs.GetBoolean("tracker", "enable", true);
+    const std::string default_tracker_type = configs.Get("tracker", "type", "bytetrack");
     const int default_track_buffer = configs.GetInteger("tracker", "track_buffer", 30);
     const float default_track_thresh = static_cast<float>(configs.GetReal("tracker", "track_thresh", 0.5));
     const float default_high_thresh = static_cast<float>(configs.GetReal("tracker", "high_thresh", 0.6));
     const float default_match_thresh = static_cast<float>(configs.GetReal("tracker", "match_thresh", 0.8));
+    const std::string default_reid_model_path = configs.Get("tracker", "reid_model_path", "model/osnet_x0_25_market.rknn");
+    const int default_reid_feature_dim = configs.GetInteger("tracker", "reid_feature_dim", 512);
+    const int default_reid_interval = configs.GetInteger("tracker", "reid_interval", 1);
+    const int default_reid_cpu_id = configs.GetInteger("tracker", "reid_cpu_id", 6);
+    const int default_reid_npu_core = configs.GetInteger("tracker", "reid_npu_core", 2);
 
     bool has_multi_video = false;
     for (int i = 0; i < 8; ++i) {
@@ -394,10 +432,16 @@ std::vector<TransCoder::Config_t> TransCoder::LoadConfigs(const std::string& con
             cfg.rknn_thread = configs.GetInteger(sec.str(), "rknn_thread", default_rknn_thread);
             cfg.rknn_thread = (cfg.rknn_thread > 6) ? 6 : cfg.rknn_thread;
             cfg.tracker_enable = configs.GetBoolean(sec.str(), "tracker_enable", default_tracker_enable);
+            cfg.tracker_type = configs.Get(sec.str(), "tracker_type", default_tracker_type);
             cfg.track_buffer = std::max(1, (int)configs.GetInteger(sec.str(), "track_buffer", default_track_buffer));
             cfg.track_thresh = static_cast<float>(configs.GetReal(sec.str(), "track_thresh", default_track_thresh));
             cfg.high_thresh = static_cast<float>(configs.GetReal(sec.str(), "high_thresh", default_high_thresh));
             cfg.match_thresh = static_cast<float>(configs.GetReal(sec.str(), "match_thresh", default_match_thresh));
+            cfg.reid_model_path = configs.Get(sec.str(), "reid_model_path", default_reid_model_path);
+            cfg.reid_feature_dim = std::max(1, (int)configs.GetInteger(sec.str(), "reid_feature_dim", default_reid_feature_dim));
+            cfg.reid_interval = std::max(1, (int)configs.GetInteger(sec.str(), "reid_interval", default_reid_interval));
+            cfg.reid_cpu_id = (int)configs.GetInteger(sec.str(), "reid_cpu_id", default_reid_cpu_id);
+            cfg.reid_npu_core = (int)configs.GetInteger(sec.str(), "reid_npu_core", default_reid_npu_core);
             cfg.device_name = configs.Get(sec.str(), "device", "");
             if (cfg.device_name.empty()) continue;
             cfg.stream_name = configs.Get(sec.str(), "stream_name", "cam" + std::to_string(i));
@@ -416,10 +460,16 @@ std::vector<TransCoder::Config_t> TransCoder::LoadConfigs(const std::string& con
         cfg.dma_buffers = std::max(2, default_dma_buffers);
         cfg.rknn_thread = (default_rknn_thread > 6) ? 6 : default_rknn_thread;
         cfg.tracker_enable = configs.GetBoolean("video", "tracker_enable", default_tracker_enable);
+        cfg.tracker_type = configs.Get("video", "tracker_type", default_tracker_type);
         cfg.track_buffer = std::max(1, (int)configs.GetInteger("video", "track_buffer", default_track_buffer));
         cfg.track_thresh = static_cast<float>(configs.GetReal("video", "track_thresh", default_track_thresh));
         cfg.high_thresh = static_cast<float>(configs.GetReal("video", "high_thresh", default_high_thresh));
         cfg.match_thresh = static_cast<float>(configs.GetReal("video", "match_thresh", default_match_thresh));
+        cfg.reid_model_path = configs.Get("video", "reid_model_path", default_reid_model_path);
+        cfg.reid_feature_dim = std::max(1, (int)configs.GetInteger("video", "reid_feature_dim", default_reid_feature_dim));
+        cfg.reid_interval = std::max(1, (int)configs.GetInteger("video", "reid_interval", default_reid_interval));
+        cfg.reid_cpu_id = (int)configs.GetInteger("video", "reid_cpu_id", default_reid_cpu_id);
+        cfg.reid_npu_core = (int)configs.GetInteger("video", "reid_npu_core", default_reid_npu_core);
         cfg.device_name = default_device;
         cfg.stream_name = default_stream_name;
         cfg.dma_heap = default_dma_heap;
@@ -443,6 +493,11 @@ void TransCoder::init()
     if (config.dma_heap.empty()) config.dma_heap = "/dev/dma_heap/system";
     config.rknn_thread = (config.rknn_thread > 6) ? 6 : std::max(1, config.rknn_thread);
     config.track_buffer = std::max(1, config.track_buffer);
+    if (config.tracker_type.empty()) config.tracker_type = "bytetrack";
+    if (config.reid_model_path.empty()) config.reid_model_path = "model/osnet_x0_25_market.rknn";
+    config.reid_feature_dim = std::max(1, config.reid_feature_dim);
+    config.reid_interval = std::max(1, config.reid_interval);
+    tracker_type_ = parse_tracker_type(config.tracker_type, config.tracker_enable);
 
     mpp_fmt = MPP_FMT_YUV420P;
 
@@ -514,16 +569,40 @@ void TransCoder::init()
         }
         m_rkyolo_list.push_back(rkyolo);
     }
-    if (config.tracker_enable) {
-        tracker_ = new ByteTrackerWrapper(config.fps, config.track_buffer,
-                                          config.track_thresh, config.high_thresh, config.match_thresh);
-        if (!tracker_) {
+    if (tracker_type_ == TrackerType::BYTETRACK) {
+        byte_tracker_ = new ByteTrackerWrapper(config.fps, config.track_buffer,
+                                               config.track_thresh, config.high_thresh, config.match_thresh);
+        if (!byte_tracker_) {
             LOG(ERROR, "[%s] create bytetrack failed", config.stream_name.c_str());
             return;
         }
-        LOG(NOTICE, "[%s] ByteTrack enabled buffer=%d track=%.2f high=%.2f match=%.2f",
+        LOG(NOTICE, "[%s] tracker=bytetrack buffer=%d track=%.2f high=%.2f match=%.2f",
             config.stream_name.c_str(), config.track_buffer,
             config.track_thresh, config.high_thresh, config.match_thresh);
+    } else if (tracker_type_ == TrackerType::DEEPSORT) {
+        FILE* fp = fopen(config.reid_model_path.c_str(), "rb");
+        if (!fp) {
+            LOG(ERROR, "[%s] deepsort model not found: %s",
+                config.stream_name.c_str(), config.reid_model_path.c_str());
+            return;
+        }
+        fclose(fp);
+
+        deep_sort_tracker_ = new DeepSortWrapper(config.reid_model_path,
+                                                 1,
+                                                 config.reid_feature_dim,
+                                                 config.reid_interval,
+                                                 config.reid_cpu_id,
+                                                 parse_rknn_core_mask(config.reid_npu_core));
+        if (!deep_sort_tracker_) {
+            LOG(ERROR, "[%s] create deepsort failed", config.stream_name.c_str());
+            return;
+        }
+        LOG(NOTICE, "[%s] tracker=deepsort model=%s interval=%d cpu=%d npu_core=%d",
+            config.stream_name.c_str(), config.reid_model_path.c_str(),
+            config.reid_interval, config.reid_cpu_id, config.reid_npu_core);
+    } else {
+        LOG(NOTICE, "[%s] tracker=none", config.stream_name.c_str());
     }
     m_cur_yolo = 0;
     ready_ = true;
@@ -579,10 +658,10 @@ void TransCoder::run()
                 PendingJob finished = std::move(pending_jobs_.front());
                 pending_jobs_.pop_front();
                 int infer_ret = finished.future.get();
-                if (finished.capture_index >= 0) {
-                    (void)v4l2_dmabuf_qbuf(&dmabuf_capture_, finished.capture_index);
-                }
                 if (infer_ret != 0) {
+                    if (finished.capture_index >= 0) {
+                        (void)v4l2_dmabuf_qbuf(&dmabuf_capture_, finished.capture_index);
+                    }
                     LOG(ERROR, "[%s] inference failed on slot %d ret=%d",
                         config.stream_name.c_str(), finished.slot, infer_ret);
                     continue;
@@ -591,16 +670,27 @@ void TransCoder::run()
                 if (finished.yolo) {
                     overlay_group = finished.yolo->GetLastDetectResult();
                 }
-                if (tracker_) {
-                    overlay_group = tracker_->Update(overlay_group);
+                if (tracker_type_ == TrackerType::BYTETRACK && byte_tracker_) {
+                    overlay_group = byte_tracker_->Update(overlay_group);
+                } else if (tracker_type_ == TrackerType::DEEPSORT && deep_sort_tracker_) {
+                    auto& capture_buf_done = dmabuf_capture_.buffers.at(finished.capture_index);
+                    overlay_group = deep_sort_tracker_->Update(
+                        static_cast<const uint8_t*>(capture_buf_done.va),
+                        config.width, config.height, overlay_group);
                 }
                 if (finished.yolo) {
                     int render_ret = finished.yolo->RenderOverlay(overlay_group, config.width, config.height);
                     if (render_ret != 0) {
+                        if (finished.capture_index >= 0) {
+                            (void)v4l2_dmabuf_qbuf(&dmabuf_capture_, finished.capture_index);
+                        }
                         LOG(ERROR, "[%s] render overlay failed on slot %d ret=%d",
                             config.stream_name.c_str(), finished.slot, render_ret);
                         continue;
                     }
+                }
+                if (finished.capture_index >= 0) {
+                    (void)v4l2_dmabuf_qbuf(&dmabuf_capture_, finished.capture_index);
                 }
                 auto& out_dma = output_dma_buffers_.at(finished.slot);
                 frameSize = rk_encoder->encode_dmabuf(out_dma.fd, out_dma.va,
@@ -625,24 +715,35 @@ void TransCoder::run()
         PendingJob finished = std::move(pending_jobs_.front());
         pending_jobs_.pop_front();
         int infer_ret = finished.future.get();
-        if (finished.capture_index >= 0) {
-            (void)v4l2_dmabuf_qbuf(&dmabuf_capture_, finished.capture_index);
-        }
         if (infer_ret != 0) {
+            if (finished.capture_index >= 0) {
+                (void)v4l2_dmabuf_qbuf(&dmabuf_capture_, finished.capture_index);
+            }
             continue;
         }
         detect_result_group_t overlay_group{};
         if (finished.yolo) {
             overlay_group = finished.yolo->GetLastDetectResult();
         }
-        if (tracker_) {
-            overlay_group = tracker_->Update(overlay_group);
+        if (tracker_type_ == TrackerType::BYTETRACK && byte_tracker_) {
+            overlay_group = byte_tracker_->Update(overlay_group);
+        } else if (tracker_type_ == TrackerType::DEEPSORT && deep_sort_tracker_) {
+            auto& capture_buf_done = dmabuf_capture_.buffers.at(finished.capture_index);
+            overlay_group = deep_sort_tracker_->Update(
+                static_cast<const uint8_t*>(capture_buf_done.va),
+                config.width, config.height, overlay_group);
         }
         if (finished.yolo) {
             int render_ret = finished.yolo->RenderOverlay(overlay_group, config.width, config.height);
             if (render_ret != 0) {
+                if (finished.capture_index >= 0) {
+                    (void)v4l2_dmabuf_qbuf(&dmabuf_capture_, finished.capture_index);
+                }
                 continue;
             }
+        }
+        if (finished.capture_index >= 0) {
+            (void)v4l2_dmabuf_qbuf(&dmabuf_capture_, finished.capture_index);
         }
         auto& out_dma = output_dma_buffers_.at(finished.slot);
         frameSize = rk_encoder->encode_dmabuf(out_dma.fd, out_dma.va,
