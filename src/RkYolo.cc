@@ -12,6 +12,10 @@
 #include <opencv2/imgproc.hpp>
 #include <vector>
 
+static void drawTextWithBackground(cv::Mat &image, const std::string &text, cv::Point org,
+                                   int fontFace, double fontScale, cv::Scalar textColor,
+                                   cv::Scalar bgColor, int thickness);
+
 RkYolo::RkYolo()
 {
 }
@@ -255,6 +259,33 @@ int RkYolo::DrawBoxesWithRga(const detect_result_group_t& group, int frame_width
     return 0;
 }
 
+int RkYolo::DrawTextWithOpenCv(const detect_result_group_t& group, int frame_width, int frame_height)
+{
+    if (!m_outbuf || frame_width <= 0 || frame_height <= 0) return -1;
+    if (group.count <= 0) return 0;
+
+    cv::Mat yuv_i420(frame_height + frame_height / 2, frame_width, CV_8UC1, (void*)m_outbuf);
+    cv::Mat bgr;
+    cv::cvtColor(yuv_i420, bgr, cv::COLOR_YUV2BGR_I420);
+
+    char text[256];
+    for (int i = 0; i < group.count; i++) {
+        const detect_result_t *det_result = &(group.results[i]);
+        sprintf(text, "%s %.1f%%", det_result->name, det_result->prop * 100);
+        int x = std::max(0, det_result->box.left);
+        int y = std::max(16, det_result->box.top - 6);
+        drawTextWithBackground(bgr, text, cv::Point(x, y),
+                               cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                               cv::Scalar(255, 255, 255),
+                               cv::Scalar(0, 64, 0), 2);
+    }
+
+    cv::Mat yuv_out;
+    cv::cvtColor(bgr, yuv_out, cv::COLOR_BGR2YUV_I420);
+    memcpy(m_outbuf, yuv_out.data, frame_width * frame_height * 3 / 2);
+    return 0;
+}
+
 void drawTextWithBackground(cv::Mat &image, const std::string &text, cv::Point org, int fontFace, double fontScale, cv::Scalar textColor, cv::Scalar bgColor, int thickness)
 {
     int baseline = 0;
@@ -313,6 +344,12 @@ int RkYolo::Inference(int in_width, int in_height)
     ret = DrawBoxesWithRga(detect_result_group, in_width, in_height);
     if (ret < 0) {
         LOG(ERROR, "draw boxes with rga failed");
+        return ret;
+    }
+
+    ret = DrawTextWithOpenCv(detect_result_group, in_width, in_height);
+    if (ret < 0) {
+        LOG(ERROR, "draw text with opencv failed");
         return ret;
     }
 

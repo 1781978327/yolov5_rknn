@@ -49,6 +49,7 @@ private:
     int PreprocessToInputMem(int in_width, int in_height);
     int ConvertInputToOutputYuv(int in_width, int in_height);
     int DrawBoxesWithRga(const detect_result_group_t& group, int frame_width, int frame_height);
+    int DrawTextWithOpenCv(const detect_result_group_t& group, int frame_width, int frame_height);
     void Destroy();
 };
 
